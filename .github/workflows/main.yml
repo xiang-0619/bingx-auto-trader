@@ -18,10 +18,15 @@ jobs:
         with:
           python-version: "3.10"
 
-      - name: Install dependencies
+      - name: Install TA-Lib system library
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libta-lib0 libta-lib-dev
+
+      - name: Install Python dependencies
         run: |
           pip install --upgrade pip
-          pip install -r requirements.txt
+          pip install ta-lib pandas numpy requests
 
       - name: Run trader
         env:
