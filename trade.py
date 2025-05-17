@@ -2,138 +2,115 @@ import requests
 import time
 import hmac
 import hashlib
+import json
+import os
+import datetime
 import pandas as pd
 import numpy as np
-import ta
-from datetime import datetime
-from config import API_KEY, SECRET_KEY, BASE_URL, TRADE_AMOUNT
+import ta  # 使用 ta-lib 替代方案（技術分析）
+import warnings
+warnings.filterwarnings("ignore")
 
-symbol_list_url = f"{BASE_URL}/v1/market/getAllContracts"
-headers = {"X-BX-APIKEY": API_KEY}
+API_KEY = os.getenv("BINGX_API_KEY")
+SECRET_KEY = os.getenv("BINGX_SECRET_KEY")
+BASE_URL = "https://open-api.bingx.com"
+TRADE_AMOUNT = 10  # 每單 USDT 數量
 
-# 測試 API 有效性
-def test_api_key():
-    try:
-        resp = requests.get(symbol_list_url, headers=headers, timeout=10)
-        if resp.status_code == 200:
-            print("✅ API Key 驗證成功")
-        else:
-            print("❌ API Key 驗證失敗，請檢查 config.py")
-            exit()
-    except Exception as e:
-        print("❌ API 連線失敗：", str(e))
-        exit()
+INTERVAL = "15m"
+LIMIT = 100
+
+headers = {
+    "X-BX-APIKEY": API_KEY
+}
+
+
+def get_server_time():
+    return str(int(time.time() * 1000))
+
+
+def sign(params):
+    query_string = '&'.join([f"{key}={params[key]}" for key in sorted(params)])
+    signature = hmac.new(SECRET_KEY.encode('utf-8'), query_string.encode('utf-8'), hashlib.sha256).hexdigest()
+    return signature
+
+
+def get_symbols():
+    url = f"{BASE_URL}/v1/market/getAllContracts"
+    response = requests.get(url).json()
+    symbols = [item['symbol'] for item in response['data'] if item['quoteAsset'] == 'USDT']
+    return symbols
+
 
 def get_klines(symbol):
     url = f"{BASE_URL}/v1/market/kline"
     params = {
         "symbol": symbol,
-        "interval": "15m",
-        "limit": 100
+        "interval": INTERVAL,
+        "limit": LIMIT
     }
-    try:
-        res = requests.get(url, params=params).json()
-        if res.get("code") == 0 and res.get("data"):
-            df = pd.DataFrame(res["data"])
-            df.columns = ['timestamp', 'open', 'high', 'low', 'close', 'volume']
-            df = df.astype(float)
-            return df
-    except:
-        pass
-    return None
-
-def calculate_indicators(df):
-    df['ema5'] = ta.trend.ema_indicator(df['close'], window=5).fillna(0)
-    df['ema20'] = ta.trend.ema_indicator(df['close'], window=20).fillna(0)
-    df['ema50'] = ta.trend.ema_indicator(df['close'], window=50).fillna(0)
-    df['rsi'] = ta.momentum.rsi(df['close'], window=14).fillna(0)
-    macd = ta.trend.macd_diff(df['close']).fillna(0)
-    df['macd_hist'] = macd
-    df['bollinger_upper'] = ta.volatility.BollingerBands(df['close']).bollinger_hband().fillna(0)
-    df['bollinger_lower'] = ta.volatility.BollingerBands(df['close']).bollinger_lband().fillna(0)
+    response = requests.get(url, params=params).json()
+    if 'data' not in response:
+        return None
+    df = pd.DataFrame(response['data'])
+    df.columns = ["timestamp", "open", "high", "low", "close", "volume"]
+    df["timestamp"] = pd.to_datetime(df["timestamp"], unit='ms')
+    df = df.astype({"open": float, "high": float, "low": float, "close": float, "volume": float})
     return df
 
-def should_long(df):
-    if df is None or len(df) < 50:
-        return False
 
-    last = df.iloc[-1]
+def apply_strategy(df):
+    df['ema_fast'] = ta.trend.ema_indicator(df['close'], window=8).ema_indicator()
+    df['ema_slow'] = ta.trend.ema_indicator(df['close'], window=21).ema_indicator()
+    df['rsi'] = ta.momentum.rsi(df['close'], window=14)
+    macd = ta.trend.macd(df['close'])
+    df['macd_diff'] = macd.macd_diff()
+
+    # 強化：多頭排列 + RSI 回升 + MACD 柱翻正 + 波動篩選
+    latest = df.iloc[-1]
     prev = df.iloc[-2]
 
-    # 條件組合 A
-    condition_a = (
-        last['ema5'] > last['ema20'] > last['ema50'] and
-        prev['rsi'] < 35 and last['rsi'] > 40 and
-        prev['macd_hist'] < 0 and last['macd_hist'] > 0
-    )
+    conditions = [
+        latest['ema_fast'] > latest['ema_slow'],               # EMA 多頭排列
+        latest['rsi'] > 50 and latest['rsi'] > prev['rsi'],    # RSI 回升
+        latest['macd_diff'] > 0 and prev['macd_diff'] <= 0,    # MACD 柱翻正
+        (latest['high'] - latest['low']) > (latest['close'] * 0.01)  # 波動 > 1%
+    ]
+    return all(conditions)
 
-    # 條件組合 B
-    condition_b = (
-        last['close'] > max(df['high'][-6:-1]) and
-        last['rsi'] > 50 and
-        last['macd_hist'] > 0 and
-        (last['bollinger_upper'] - last['bollinger_lower']) > (df['bollinger_upper'] - df['bollinger_lower']).mean()
-    )
 
-    return condition_a or condition_b
-
-def get_positions():
-    url = f"{BASE_URL}/v1/user/positions"
-    timestamp = str(int(time.time() * 1000))
-    sign = hmac.new(SECRET_KEY.encode(), timestamp.encode(), hashlib.sha256).hexdigest()
-    headers_signed = {
-        "X-BX-APIKEY": API_KEY,
-        "X-BX-SIGNATURE": sign,
-        "X-BX-TIMESTAMP": timestamp
+def place_order(symbol, side):
+    timestamp = get_server_time()
+    url = f"{BASE_URL}/v1/user/market/order"
+    params = {
+        "symbol": symbol,
+        "side": side,
+        "positionSide": "LONG",
+        "type": "MARKET",
+        "quantity": str(TRADE_AMOUNT),
+        "timestamp": timestamp
     }
-    try:
-        res = requests.get(url, headers=headers_signed, timeout=10).json()
-        if res.get("code") == 0:
-            return [p['symbol'] for p in res['data'] if p['positionAmt'] != "0"]
-    except:
-        pass
-    return []
+    params['signature'] = sign(params)
+    response = requests.post(url, headers=headers, data=params)
+    print(f"下單結果 ({symbol}):", response.text)
 
-def place_order(symbol):
-    url = f"{BASE_URL}/v1/user/submitOrder"
-    timestamp = str(int(time.time() * 1000))
-    body = f"symbol={symbol}&price=0&vol={TRADE_AMOUNT}&side=1&type=1&open_type=1&position_id=0&leverage=10&external_oid=auto_trade_{timestamp}&stop_loss=0&take_profit=0&position_mode=1"
-    sign = hmac.new(SECRET_KEY.encode(), (body + timestamp).encode(), hashlib.sha256).hexdigest()
-    headers_signed = {
-        "X-BX-APIKEY": API_KEY,
-        "X-BX-SIGNATURE": sign,
-        "X-BX-TIMESTAMP": timestamp,
-        "Content-Type": "application/x-www-form-urlencoded"
-    }
-    try:
-        res = requests.post(url, headers=headers_signed, data=body).json()
-        if res.get("code") == 0:
-            print(f"✅ 開多成功: {symbol}")
-        else:
-            print(f"❌ 下單失敗: {symbol}, 錯誤: {res}")
-    except Exception as e:
-        print(f"❌ 下單異常: {symbol} => {e}")
 
 def main():
-    test_api_key()
-    res = requests.get(symbol_list_url, headers=headers).json()
-    if res.get("code") != 0:
-        print("❌ 無法獲取幣種清單")
-        return
-
-    symbols = [s["symbol"] for s in res["data"] if "USDT" in s["symbol"]]
-    opened_symbols = get_positions()
-
+    symbols = get_symbols()
+    print(f"共取得 {len(symbols)} 個交易對")
     for symbol in symbols:
-        if symbol in opened_symbols:
-            continue
-        df = get_klines(symbol)
-        if df is None:
-            continue
-        df = calculate_indicators(df)
-        if should_long(df):
-            place_order(symbol)
-        time.sleep(0.5)
+        try:
+            df = get_klines(symbol)
+            if df is not None and len(df) >= 30:
+                if apply_strategy(df):
+                    print(f"[✅ 訊號] {symbol} 符合條件，嘗試開多單")
+                    place_order(symbol, "BUY")
+                else:
+                    print(f"[❌ 無訊號] {symbol} 略過")
+            else:
+                print(f"[⚠️ 資料不足] {symbol} 無法分析")
+        except Exception as e:
+            print(f"[錯誤] {symbol}: {e}")
+
 
 if __name__ == "__main__":
     main()
