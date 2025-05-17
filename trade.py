@@ -1,125 +1,95 @@
 import os
 import time
-import hmac
-import hashlib
-import json
 import requests
 import pandas as pd
-import pandas_ta as ta
+import numpy as np
+from datetime import datetime
+from ta.trend import EMAIndicator, MACD
+from ta.momentum import RSIIndicator
 
-API_KEY = os.getenv('BINGX_API_KEY')
-SECRET_KEY = os.getenv('BINGX_SECRET_KEY')
-BASE_URL = "https://api.bingx.com"
+from config import API_KEY, SECRET_KEY, BASE_URL, TRADE_AMOUNT
 
-TRADE_AMOUNT = 10  # 每單 10 USDT
-
-def sign_request(params: dict, secret: str):
-    """BingX API 簽名"""
-    query = '&'.join([f"{k}={params[k]}" for k in sorted(params)])
-    return hmac.new(secret.encode(), query.encode(), hashlib.sha256).hexdigest()
+INTERVAL = "15m"
+LIMIT = 100
+SYMBOL_LIST = []  # 留空代表自動讀取全部支持的交易對
+POSITION_TRACKER = {}  # 用來追蹤目前持倉的幣
 
 def get_symbols():
     url = f"{BASE_URL}/api/v1/market/getAllContracts"
-    response = requests.get(url)
-    data = response.json()
-    if data.get("code") != 0:
-        print("❌ 取得幣種失敗:", data)
-        return []
-    return [item['symbol'] for item in data['data'] if 'USDT' in item['symbol']]
+    res = requests.get(url).json()
+    return [s['symbol'] for s in res['data'] if s['contractType'] == 'linear_perpetual']
 
-def get_klines(symbol, interval="15m", limit=100):
+def get_klines(symbol):
     url = f"{BASE_URL}/api/v1/market/kline"
-    params = {"symbol": symbol, "interval": interval, "limit": limit}
-    response = requests.get(url, params=params)
-    data = response.json()
-    if data.get('code') != 0 or 'data' not in data:
-        print(f"❌ 取得 {symbol} K 線失敗")
-        return None
-    df = pd.DataFrame(data['data'])
-    df.columns = ["timestamp", "open", "high", "low", "close", "volume"]
+    params = {"symbol": symbol, "interval": INTERVAL, "limit": LIMIT}
+    res = requests.get(url, params=params).json()
+    df = pd.DataFrame(res['data'], columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
     df = df.astype(float)
     return df
 
-def get_max_leverage(symbol):
-    url = f"{BASE_URL}/api/v1/futures/max_leverage?symbol={symbol}"
-    try:
-        resp = requests.get(url)
-        data = resp.json()
-        if data.get("code") == 0 and "data" in data:
-            return int(data["data"].get("maxLeverage", 20))
-    except Exception as e:
-        print(f"⚠️ 取得槓桿錯誤: {e}")
-    return 20  # 預設20倍
-
-def place_order(symbol, side, amount_usdt):
-    path = "/api/v1/futures/order"
-    timestamp = int(time.time() * 1000)
-
-    leverage = get_max_leverage(symbol)
-
-    params = {
-        "symbol": symbol,
-        "side": side,
-        "type": "MARKET",
-        "quantity": amount_usdt,
-        "timestamp": timestamp,
-        "leverage": leverage
-    }
-    params["signature"] = sign_request(params, SECRET_KEY)
-
-    headers = {
-        "X-BX-APIKEY": API_KEY,
-        "Content-Type": "application/json"
-    }
-
-    url = BASE_URL + path
-    resp = requests.post(url, headers=headers, data=json.dumps(params))
-    result = resp.json()
-
-    if resp.status_code == 200 and result.get("code") == 0:
-        print(f"✅ 下單成功: {symbol} {side} {amount_usdt} USDT 槓桿 {leverage}倍")
-    else:
-        print(f"❌ 下單失敗: {result}")
-
-def apply_strategy(df):
-    df['EMA20'] = ta.ema(df['close'], length=20)
-    df['EMA50'] = ta.ema(df['close'], length=50)
-    macd = ta.macd(df['close'])
-    df['MACD_hist'] = macd['MACDh_12_26_9']
-    df['RSI'] = ta.rsi(df['close'], length=14)
+def strategy(df):
+    df['ema_20'] = EMAIndicator(df['close'], window=20).ema_indicator()
+    df['ema_50'] = EMAIndicator(df['close'], window=50).ema_indicator()
+    macd = MACD(df['close'])
+    df['macd'] = macd.macd()
+    df['macd_hist'] = macd.macd_diff()
+    df['rsi'] = RSIIndicator(df['close'], window=14).rsi()
 
     latest = df.iloc[-1]
     prev = df.iloc[-2]
 
-    ema_trend = latest['EMA20'] > latest['EMA50']
-    rsi_rebound = latest['RSI'] > prev['RSI'] and latest['RSI'] < 70
-    macd_turn_green = latest['MACD_hist'] > 0 and prev['MACD_hist'] < 0
-    volatility = (latest['high'] - latest['low']) / latest['low'] > 0.01
+    # 條件 1: MACD 柱轉正
+    cond_macd = latest['macd_hist'] > 0 and prev['macd_hist'] <= 0
+    # 條件 2: RSI 回升
+    cond_rsi = latest['rsi'] > prev['rsi'] and latest['rsi'] < 70
+    # 條件 3: EMA 多頭排列
+    cond_ema = latest['ema_20'] > latest['ema_50']
+    # 條件 4: 波動幅度高（當前K棒超過平均幅度1.5倍）
+    avg_range = (df['high'] - df['low']).rolling(window=20).mean().iloc[-2]
+    cond_volatility = (latest['high'] - latest['low']) > 1.5 * avg_range
 
-    if ema_trend and rsi_rebound and macd_turn_green and volatility:
-        return "BUY"
-    else:
-        # 這裡改成做空訊號，也可以改成 None 跳過
-        return "SELL"
+    return cond_macd or cond_rsi or cond_ema or cond_volatility
 
-def main():
-    symbols = get_symbols()
-    print(f"開始檢查 {len(symbols)} 個幣種...")
+def has_position(symbol):
+    return POSITION_TRACKER.get(symbol, False)
+
+def set_position(symbol, status=True):
+    POSITION_TRACKER[symbol] = status
+
+def place_order(symbol, side):
+    print(f"[下單] {symbol} 開倉方向: {side}")
+
+    url = f"{BASE_URL}/api/v1/user/contract/order"
+    params = {
+        "symbol": symbol,
+        "side": side,
+        "positionSide": "LONG",
+        "type": "MARKET",
+        "quantity": TRADE_AMOUNT,
+        "timestamp": int(time.time() * 1000),
+    }
+    headers = {"X-BX-APIKEY": API_KEY}
+    res = requests.post(url, params=params, headers=headers)
+    print(res.json())
+    set_position(symbol, True)
+
+def run():
+    symbols = SYMBOL_LIST or get_symbols()
+    print(f"[執行時間] {datetime.now()} - 監控交易對數量: {len(symbols)}")
 
     for symbol in symbols:
         try:
-            df = get_klines(symbol)
-            if df is None or len(df) < 50:
+            if has_position(symbol):
+                print(f"[略過] {symbol} 已持倉")
                 continue
 
-            signal = apply_strategy(df)
-            if signal in ["BUY", "SELL"]:
-                place_order(symbol, signal, TRADE_AMOUNT)
-
-            time.sleep(0.2)
-
+            df = get_klines(symbol)
+            if strategy(df):
+                place_order(symbol, "BUY")
+            else:
+                print(f"[無信號] {symbol}")
         except Exception as e:
-            print(f"⚠️ 分析 {symbol} 時發生錯誤: {e}")
+            print(f"[錯誤] {symbol}: {e}")
 
 if __name__ == "__main__":
-    main()
+    run()
