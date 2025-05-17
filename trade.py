@@ -1,88 +1,92 @@
 import requests
 import time
-import numpy as np
 import hmac
 import hashlib
-import os
+import numpy as np
+import talib
 
+API_KEY = "你的API_KEY"
+API_SECRET = "你的API_SECRET"
 BASE_URL = "https://open-api.bingx.com"
-API_KEY = os.getenv("BINGX_API_KEY")
-SECRET_KEY = os.getenv("BINGX_SECRET_KEY")
-TRADE_SYMBOLS = ["BTC-USDT", "ETH-USDT", "XRP-USDT", "SOL-USDT", "DOGE-USDT"]
-TRADE_AMOUNT = 5  # 每筆下單金額（USDT）
 
-def sign(query_string, secret_key):
-    return hmac.new(secret_key.encode('utf-8'), query_string.encode('utf-8'), hashlib.sha256).hexdigest()
+TRADE_AMOUNT = 10  # 單筆下單金額（USDT）
+
+def get_server_time():
+    return int(time.time() * 1000)
+
+def sign_request(params):
+    query_string = "&".join([f"{k}={v}" for k, v in sorted(params.items())])
+    signature = hmac.new(API_SECRET.encode(), query_string.encode(), hashlib.sha256).hexdigest()
+    return f"{query_string}&signature={signature}"
+
+def get_symbols():
+    url = f"{BASE_URL}/openApi/swap/v2/quote/contracts"
+    return [s['symbol'] for s in requests.get(url).json()['data']]
 
 def get_klines(symbol):
     url = f"{BASE_URL}/openApi/swap/v2/quote/klines?symbol={symbol}&interval=30m&limit=100"
-    response = requests.get(url).json()
-    return response['data']
+    return requests.get(url).json()['data']
 
 def calculate_indicators(prices):
     closes = np.array([float(c[4]) for c in prices])
-    rsi = calculate_rsi(closes)
-    macd_hist = calculate_macd(closes)
-    ema_fast = closes[-5:].mean()
-    ema_slow = closes[-20:].mean()
-    return rsi[-1], macd_hist[-1], ema_fast, ema_slow
+    ema_fast = talib.EMA(closes, timeperiod=12)
+    ema_slow = talib.EMA(closes, timeperiod=26)
+    macd, macdsignal, _ = talib.MACD(closes, fastperiod=12, slowperiod=26, signalperiod=9)
+    rsi = talib.RSI(closes, timeperiod=14)
+    return ema_fast, ema_slow, macd, macdsignal, rsi
 
-def calculate_rsi(prices, period=14):
-    deltas = np.diff(prices)
-    gain = np.maximum(deltas, 0)
-    loss = np.maximum(-deltas, 0)
-    avg_gain = np.convolve(gain, np.ones((period,))/period, mode='valid')
-    avg_loss = np.convolve(loss, np.ones((period,))/period, mode='valid')
-    rs = avg_gain / (avg_loss + 1e-6)
-    return 100 - (100 / (1 + rs))
+def should_buy(ema_fast, ema_slow, macd, macdsignal, rsi):
+    return (
+        ema_fast[-1] > ema_slow[-1] and
+        macd[-1] > macdsignal[-1] and
+        rsi[-1] < 70
+    )
 
-def calculate_macd(prices, short=12, long=26, signal=9):
-    ema_short = ema(prices, short)
-    ema_long = ema(prices, long)
-    macd = ema_short - ema_long
-    signal_line = ema(macd, signal)
-    return macd - signal_line
-
-def ema(data, window):
-    weights = np.exp(np.linspace(-1., 0., window))
-    weights /= weights.sum()
-    return np.convolve(data, weights, mode='full')[:len(data)]
+def should_sell(ema_fast, ema_slow, macd, macdsignal, rsi):
+    return (
+        ema_fast[-1] < ema_slow[-1] and
+        macd[-1] < macdsignal[-1] and
+        rsi[-1] > 30
+    )
 
 def place_order(symbol, side):
-    timestamp = int(time.time() * 1000)
-    endpoint = "/openApi/swap/v2/trade/order"
-    url = BASE_URL + endpoint
-
+    path = "/openApi/swap/v2/trade/order"
+    timestamp = get_server_time()
     params = {
         "symbol": symbol,
-        "side": side,
-        "positionSide": "BOTH",
-        "type": "MARKET",
-        "quantity": str(TRADE_AMOUNT),
-        "timestamp": timestamp
+        "price": "0",  # 市價單
+        "vol": str(TRADE_AMOUNT),
+        "side": "1" if side == "BUY" else "2",
+        "type": "1",
+        "open_type": "1",
+        "position_id": "0",
+        "leverage": "10",
+        "external_oid": str(timestamp),
+        "stop_loss_price": "",
+        "take_profit_price": "",
+        "timestamp": str(timestamp),
+        "apiKey": API_KEY,
     }
+    signed_query = sign_request(params)
+    headers = {"Content-Type": "application/x-www-form-urlencoded"}
+    url = f"{BASE_URL}{path}?{signed_query}"
+    res = requests.post(url, headers=headers)
+    print(f"{symbol} {side} 訂單回應：", res.json())
 
-    query_string = '&'.join([f"{key}={params[key]}" for key in sorted(params)])
-    signature = sign(query_string, SECRET_KEY)
-    headers = {"X-BX-APIKEY": API_KEY}
-    final_url = url + "?" + query_string + f"&signature={signature}"
-    response = requests.post(final_url, headers=headers)
-    print(f"{symbol} {side} Order Response:", response.json())
-
-def main():
-    for symbol in TRADE_SYMBOLS:
+def run():
+    symbols = get_symbols()
+    for symbol in symbols:
         try:
-            klines = get_klines(symbol)
-            rsi, macd_hist, ema_fast, ema_slow = calculate_indicators(klines)
-
-            print(f"{symbol} | RSI: {rsi:.2f}, MACD: {macd_hist:.4f}, EMA: {ema_fast:.2f} / {ema_slow:.2f}")
-
-            if ema_fast > ema_slow and rsi < 70 and macd_hist > 0:
+            prices = get_klines(symbol)
+            if len(prices) < 30:
+                continue
+            ema_fast, ema_slow, macd, macdsignal, rsi = calculate_indicators(prices)
+            if should_buy(ema_fast, ema_slow, macd, macdsignal, rsi):
                 place_order(symbol, "BUY")
-            elif ema_fast < ema_slow and rsi > 30 and macd_hist < 0:
+            elif should_sell(ema_fast, ema_slow, macd, macdsignal, rsi):
                 place_order(symbol, "SELL")
         except Exception as e:
-            print(f"Error with {symbol}: {e}")
+            print(f"{symbol} 發生錯誤：{e}")
 
 if __name__ == "__main__":
-    main()
+    run()
