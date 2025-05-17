@@ -1,4 +1,4 @@
-ta-lib-binary==0.4.0
+ta-lib
 pandas
 numpy
 requests
