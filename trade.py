@@ -1,86 +1,107 @@
 import time
-import hmac
-import hashlib
 import requests
-import numpy as np
-import talib
+import pandas as pd
+from ta.trend import EMAIndicator, MACD
+from ta.momentum import RSIIndicator
+import os
 
-# 設定你的 BingX API 金鑰
-API_KEY = "你的API_KEY"
-API_SECRET = "你的API_SECRET"
-BASE_URL = "https://open-api.bingx.com"
+API_KEY = os.getenv("BINGX_API_KEY")
+API_SECRET = os.getenv("BINGX_SECRET_KEY")
+BASE_URL = "https://api.bingx.com"  # 請確認官方合約API網址
 
-TRADE_AMOUNT = 10  # 每筆下單金額（USDT）
-INTERVAL = "1h"    # K線週期
-TRADE_SYMBOLS = []  # 如果你要指定幣種，可在這裡列出，否則預設使用熱門幣種
+TRADE_AMOUNT_USDT = 10  # 每筆交易金額
 
-# 取得時間戳記
-def get_server_time():
-    return int(time.time() * 1000)
+HEADERS = {
+    "X-BX-APIKEY": API_KEY,
+    # 可能還要簽名等，視官方API規定
+}
 
-# 建立簽名
-def sign(query_string, secret):
-    return hmac.new(secret.encode(), query_string.encode(), hashlib.sha256).hexdigest()
+def fetch_all_symbols():
+    url = f"{BASE_URL}/api/v1/market/symbols"
+    resp = requests.get(url)
+    data = resp.json()
+    if not data.get('success', True):
+        print("取得幣種列表失敗:", data)
+        return []
+    # 只要永續合約 PERPETUAL (實際key依API文件調整)
+    symbols = [item['symbol'] for item in data['data'] if item.get('contractType', '') == 'PERPETUAL']
+    print(f"抓到 {len(symbols)} 個合約交易幣種")
+    return symbols
 
-# 取得幣種清單
-def get_symbols():
-    url = f"{BASE_URL}/openApi/swap/v2/quote/contracts"
-    res = requests.get(url).json()
-    return [item['symbol'] for item in res['data']]
+def fetch_klines(symbol, interval='30m', limit=100):
+    url = f"{BASE_URL}/api/v1/market/kline?symbol={symbol}&interval={interval}&limit={limit}"
+    response = requests.get(url)
+    data = response.json()
+    if not data.get('success', True):
+        print(f"{symbol} 取得K線失敗: {data}")
+        return None
+    klines = data['data']
+    df = pd.DataFrame(klines, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+    df['close'] = df['close'].astype(float)
+    return df
 
-# 取得歷史K線
-def get_klines(symbol):
-    url = f"{BASE_URL}/openApi/swap/v2/quote/klines?symbol={symbol}&interval={INTERVAL}&limit=100"
-    return requests.get(url).json()['data']
+def calculate_indicators(df):
+    df['ema'] = EMAIndicator(df['close'], window=20).ema_indicator()
+    df['rsi'] = RSIIndicator(df['close'], window=14).rsi()
+    macd = MACD(df['close'])
+    df['macd'] = macd.macd()
+    df['macd_signal'] = macd.macd_signal()
+    return df
 
-# 計算技術指標（EMA, RSI, MACD）
-def calculate_indicators(prices):
-    closes = np.array([float(c[4]) for c in prices])
-    ema_fast = talib.EMA(closes, timeperiod=12)
-    ema_slow = talib.EMA(closes, timeperiod=26)
-    rsi = talib.RSI(closes, timeperiod=14)
-    macd, macdsignal, _ = talib.MACD(closes, fastperiod=12, slowperiod=26, signalperiod=9)
-    return ema_fast, ema_slow, rsi, macd, macdsignal
+def check_trade_signal(df):
+    last = df.iloc[-1]
+    prev = df.iloc[-2]
 
-# 判斷是否為做多訊號
-def should_open_long(ema_fast, ema_slow, rsi, macd, macdsignal):
-    return (
-        ema_fast[-1] > ema_slow[-1] and
-        rsi[-1] > 50 and
-        macd[-1] > macdsignal[-1]
-    )
+    bullish_trend = last['close'] > last['ema']
+    bearish_trend = last['close'] < last['ema']
 
-# 下單（做多）
-def place_order(symbol, side):
-    path = "/openApi/swap/v2/trade/order"
-    timestamp = get_server_time()
-    data = {
+    rsi = last['rsi']
+    rsi_buy = rsi < 30
+    rsi_sell = rsi > 70
+
+    macd_cross_up = prev['macd'] < prev['macd_signal'] and last['macd'] > last['macd_signal']
+    macd_cross_down = prev['macd'] > prev['macd_signal'] and last['macd'] < last['macd_signal']
+
+    if bullish_trend and macd_cross_up and rsi_buy:
+        return "BUY"   # 多單進場
+
+    if bearish_trend and macd_cross_down and rsi_sell:
+        return "SELL"  # 空單進場
+
+    return "HOLD"
+
+def place_order(symbol, side, amount_usdt):
+    # 合約下單範例，依BingX官方API調整
+    # 這裡簡化示範，實際要計算手數、簽名、傳header等
+    print(f"下單: {symbol} {side} {amount_usdt} USDT 合約")
+
+    url = f"{BASE_URL}/api/v1/order"
+    payload = {
         "symbol": symbol,
-        "side": side,
+        "side": side,  # BUY或SELL
         "type": "MARKET",
-        "positionSide": "LONG",
-        "quantity": str(TRADE_AMOUNT),
-        "timestamp": timestamp,
-        "recvWindow": 5000,
+        "quantity": amount_usdt,  # 這裡要轉成合約手數，需查合約價值換算
+        "positionSide": "LONG" if side == "BUY" else "SHORT",  # 多單或空單
+        # 其他必要參數...
     }
-    query_string = '&'.join([f"{k}={v}" for k, v in sorted(data.items())])
-    data["signature"] = sign(query_string, API_SECRET)
-    headers = {"X-BX-APIKEY": API_KEY}
-    response = requests.post(f"{BASE_URL}{path}", headers=headers, params=data)
-    print(f"{symbol} 下單結果：", response.json())
+    # headers = {...}  # 含簽名和API KEY
+    # response = requests.post(url, json=payload, headers=headers)
+    # print(response.json())
 
-# 主程式邏輯
 def main():
-    symbols = TRADE_SYMBOLS or get_symbols()
-    for symbol in symbols:
-        try:
-            prices = get_klines(symbol)
-            ema_fast, ema_slow, rsi, macd, macdsignal = calculate_indicators(prices)
-            if should_open_long(ema_fast, ema_slow, rsi, macd, macdsignal):
-                place_order(symbol, "BUY")
-        except Exception as e:
-            print(f"{symbol} 處理失敗：{e}")
+    while True:
+        symbols = fetch_all_symbols()
+        for symbol in symbols:
+            df = fetch_klines(symbol)
+            if df is None or df.empty:
+                continue
+            df = calculate_indicators(df)
+            signal = check_trade_signal(df)
+            print(f"{symbol} 訊號: {signal}")
+            if signal in ["BUY", "SELL"]:
+                place_order(symbol, signal, TRADE_AMOUNT_USDT)
+        print("等待30分鐘後繼續...")
+        time.sleep(30 * 60)
 
-# 每30分鐘運行一次（配合 GitHub Actions）
 if __name__ == "__main__":
     main()
