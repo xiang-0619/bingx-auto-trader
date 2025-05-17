@@ -1,95 +1,94 @@
 import os
 import time
 import requests
+import hmac
+import hashlib
 import pandas as pd
 import numpy as np
-from datetime import datetime
-from ta.trend import EMAIndicator, MACD
-from ta.momentum import RSIIndicator
+import ta
 
-from config import API_KEY, SECRET_KEY, BASE_URL, TRADE_AMOUNT
+# 環境變數設定（來自 GitHub Secrets）
+API_KEY = os.getenv("BINGX_API_KEY")
+SECRET_KEY = os.getenv("BINGX_SECRET_KEY")
+BASE_URL = os.getenv("BINGX_BASE_URL", "https://api.bingx.com")
+TRADE_AMOUNT = float(os.getenv("TRADE_AMOUNT", 10))
 
 INTERVAL = "15m"
 LIMIT = 100
-SYMBOL_LIST = []  # 留空代表自動讀取全部支持的交易對
-POSITION_TRACKER = {}  # 用來追蹤目前持倉的幣
+HEADERS = {"X-BX-APIKEY": API_KEY}
 
-def get_symbols():
-    url = f"{BASE_URL}/api/v1/market/getAllContracts"
-    res = requests.get(url).json()
-    return [s['symbol'] for s in res['data'] if s['contractType'] == 'linear_perpetual']
+def sign(params: dict):
+    query_string = "&".join([f"{key}={params[key]}" for key in sorted(params)])
+    signature = hmac.new(SECRET_KEY.encode('utf-8'), query_string.encode('utf-8'), hashlib.sha256).hexdigest()
+    return signature
 
-def get_klines(symbol):
-    url = f"{BASE_URL}/api/v1/market/kline"
-    params = {"symbol": symbol, "interval": INTERVAL, "limit": LIMIT}
-    res = requests.get(url, params=params).json()
-    df = pd.DataFrame(res['data'], columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-    df = df.astype(float)
-    return df
-
-def strategy(df):
-    df['ema_20'] = EMAIndicator(df['close'], window=20).ema_indicator()
-    df['ema_50'] = EMAIndicator(df['close'], window=50).ema_indicator()
-    macd = MACD(df['close'])
-    df['macd'] = macd.macd()
-    df['macd_hist'] = macd.macd_diff()
-    df['rsi'] = RSIIndicator(df['close'], window=14).rsi()
-
-    latest = df.iloc[-1]
-    prev = df.iloc[-2]
-
-    # 條件 1: MACD 柱轉正
-    cond_macd = latest['macd_hist'] > 0 and prev['macd_hist'] <= 0
-    # 條件 2: RSI 回升
-    cond_rsi = latest['rsi'] > prev['rsi'] and latest['rsi'] < 70
-    # 條件 3: EMA 多頭排列
-    cond_ema = latest['ema_20'] > latest['ema_50']
-    # 條件 4: 波動幅度高（當前K棒超過平均幅度1.5倍）
-    avg_range = (df['high'] - df['low']).rolling(window=20).mean().iloc[-2]
-    cond_volatility = (latest['high'] - latest['low']) > 1.5 * avg_range
-
-    return cond_macd or cond_rsi or cond_ema or cond_volatility
-
-def has_position(symbol):
-    return POSITION_TRACKER.get(symbol, False)
-
-def set_position(symbol, status=True):
-    POSITION_TRACKER[symbol] = status
-
-def place_order(symbol, side):
-    print(f"[下單] {symbol} 開倉方向: {side}")
-
-    url = f"{BASE_URL}/api/v1/user/contract/order"
+def get_klines(symbol: str):
+    url = f"{BASE_URL}/v1/market/kline"
     params = {
         "symbol": symbol,
-        "side": side,
-        "positionSide": "LONG",
+        "interval": INTERVAL,
+        "limit": LIMIT
+    }
+    try:
+        response = requests.get(url, params=params)
+        data = response.json()
+        if "data" in data:
+            df = pd.DataFrame(data["data"])
+            df["open"] = df["open"].astype(float)
+            df["high"] = df["high"].astype(float)
+            df["low"] = df["low"].astype(float)
+            df["close"] = df["close"].astype(float)
+            df["volume"] = df["volume"].astype(float)
+            return df
+        else:
+            return None
+    except:
+        return None
+
+def technical_signal(df):
+    df["ema20"] = ta.trend.ema_indicator(df["close"], window=20).fillna(0)
+    df["ema50"] = ta.trend.ema_indicator(df["close"], window=50).fillna(0)
+    df["macd_hist"] = ta.trend.macd_diff(df["close"]).fillna(0)
+    df["rsi"] = ta.momentum.rsi(df["close"], window=14).fillna(0)
+
+    ema_bullish = df["ema20"].iloc[-1] > df["ema50"].iloc[-1]
+    macd_positive = df["macd_hist"].iloc[-1] > 0 and df["macd_hist"].iloc[-2] <= 0
+    rsi_rebound = df["rsi"].iloc[-1] > df["rsi"].iloc[-2] and df["rsi"].iloc[-1] > 40
+
+    return ema_bullish and macd_positive and rsi_rebound
+
+def place_order(symbol: str):
+    timestamp = int(time.time() * 1000)
+    params = {
+        "symbol": symbol,
+        "side": "BUY",
         "type": "MARKET",
         "quantity": TRADE_AMOUNT,
-        "timestamp": int(time.time() * 1000),
+        "timestamp": timestamp
     }
-    headers = {"X-BX-APIKEY": API_KEY}
-    res = requests.post(url, params=params, headers=headers)
-    print(res.json())
-    set_position(symbol, True)
+    params["signature"] = sign(params)
+    url = f"{BASE_URL}/v1/user/contract/order"
+    try:
+        response = requests.post(url, headers=HEADERS, params=params)
+        print(f"Order placed for {symbol}: {response.text}")
+    except Exception as e:
+        print(f"Order failed for {symbol}: {str(e)}")
 
-def run():
-    symbols = SYMBOL_LIST or get_symbols()
-    print(f"[執行時間] {datetime.now()} - 監控交易對數量: {len(symbols)}")
+def get_all_symbols():
+    url = f"{BASE_URL}/v1/market/getAllContracts"
+    try:
+        response = requests.get(url)
+        data = response.json()
+        return [s["symbol"] for s in data.get("data", []) if "USDT" in s["symbol"]]
+    except:
+        return []
 
+def main():
+    symbols = get_all_symbols()
     for symbol in symbols:
-        try:
-            if has_position(symbol):
-                print(f"[略過] {symbol} 已持倉")
-                continue
-
-            df = get_klines(symbol)
-            if strategy(df):
-                place_order(symbol, "BUY")
-            else:
-                print(f"[無信號] {symbol}")
-        except Exception as e:
-            print(f"[錯誤] {symbol}: {e}")
+        df = get_klines(symbol)
+        if df is not None and technical_signal(df):
+            place_order(symbol)
 
 if __name__ == "__main__":
-    run()
+    main()
