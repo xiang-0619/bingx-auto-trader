@@ -28,11 +28,13 @@ jobs:
           ./configure --prefix=/usr
           make
           sudo make install
+          cd ..
+          rm -rf ta-lib ta-lib-0.4.0-src.tar.gz
 
       - name: Install Python dependencies
         run: |
           pip install --upgrade pip
-          pip install ta-lib pandas numpy requests
+          pip install --no-cache-dir ta-lib pandas numpy requests
 
       - name: Run trader
         env:
