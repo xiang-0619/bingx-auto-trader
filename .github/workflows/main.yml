@@ -1,16 +1,16 @@
-name: Run BingX Auto Trader
+name: Run Trader
 
 on:
   schedule:
-    - cron: '*/15 * * * *'  # 每15分鐘執行
+    - cron: "*/15 * * * *"
   workflow_dispatch:
 
 jobs:
-  trader:
+  run:
     runs-on: ubuntu-latest
 
     steps:
-    - name: Checkout repository
+    - name: Checkout repo
       uses: actions/checkout@v3
 
     - name: Set up Python
@@ -18,10 +18,22 @@ jobs:
       with:
         python-version: '3.10'
 
-    - name: Install dependencies
+    - name: Install TA-Lib dependencies
       run: |
-        python -m pip install --upgrade pip
-        pip install numpy requests ta
+        sudo apt-get update
+        sudo apt-get install -y build-essential wget
+        wget http://prdownloads.sourceforge.net/ta-lib/ta-lib-0.4.0-src.tar.gz
+        tar -xvzf ta-lib-0.4.0-src.tar.gz
+        cd ta-lib/
+        ./configure --prefix=/usr
+        make
+        sudo make install
+
+    - name: Install Python dependencies
+      run: |
+        pip install --upgrade pip
+        pip install -r requirements.txt
+
     - name: Run trader
       env:
         BINGX_API_KEY: ${{ secrets.BINGX_API_KEY }}
