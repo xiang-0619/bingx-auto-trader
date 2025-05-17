@@ -1,4 +1,3 @@
-ta-lib
 pandas
-numpy
+pandas-ta
 requests
