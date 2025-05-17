@@ -1,86 +1,67 @@
+import requests
 import time
 import hmac
 import hashlib
-import requests
 import numpy as np
-import talib
+import ta
+from config import API_KEY, SECRET_KEY, BASE_URL, TRADE_AMOUNT
 
-# 設定你的 BingX API 金鑰
-API_KEY = "你的API_KEY"
-API_SECRET = "你的API_SECRET"
-BASE_URL = "https://open-api.bingx.com"
-
-TRADE_AMOUNT = 10  # 每筆下單金額（USDT）
-INTERVAL = "1h"    # K線週期
-TRADE_SYMBOLS = []  # 如果你要指定幣種，可在這裡列出，否則預設使用熱門幣種
-
-# 取得時間戳記
 def get_server_time():
     return int(time.time() * 1000)
 
-# 建立簽名
-def sign(query_string, secret):
-    return hmac.new(secret.encode(), query_string.encode(), hashlib.sha256).hexdigest()
+def sign(params):
+    query_string = '&'.join([f"{k}={v}" for k, v in sorted(params.items())])
+    signature = hmac.new(SECRET_KEY.encode(), query_string.encode(), hashlib.sha256).hexdigest()
+    return signature
 
-# 取得幣種清單
 def get_symbols():
     url = f"{BASE_URL}/openApi/swap/v2/quote/contracts"
-    res = requests.get(url).json()
-    return [item['symbol'] for item in res['data']]
+    return [s['symbol'] for s in requests.get(url).json()['data']]
 
-# 取得歷史K線
 def get_klines(symbol):
-    url = f"{BASE_URL}/openApi/swap/v2/quote/klines?symbol={symbol}&interval={INTERVAL}&limit=100"
+    url = f"{BASE_URL}/openApi/swap/v2/quote/klines?symbol={symbol}&interval=15m&limit=100"
     return requests.get(url).json()['data']
 
-# 計算技術指標（EMA, RSI, MACD）
-def calculate_indicators(prices):
-    closes = np.array([float(c[4]) for c in prices])
-    ema_fast = talib.EMA(closes, timeperiod=12)
-    ema_slow = talib.EMA(closes, timeperiod=26)
-    rsi = talib.RSI(closes, timeperiod=14)
-    macd, macdsignal, _ = talib.MACD(closes, fastperiod=12, slowperiod=26, signalperiod=9)
-    return ema_fast, ema_slow, rsi, macd, macdsignal
+def calculate_signals(prices):
+    df = np.array(prices, dtype=float)
+    close = df[:, 4]
+    if len(close) < 50:
+        return False
 
-# 判斷是否為做多訊號
-def should_open_long(ema_fast, ema_slow, rsi, macd, macdsignal):
-    return (
-        ema_fast[-1] > ema_slow[-1] and
-        rsi[-1] > 50 and
-        macd[-1] > macdsignal[-1]
-    )
+    rsi = ta.momentum.RSIIndicator(close).rsi().values[-1]
+    macd_diff = ta.trend.MACD(close).macd_diff().values[-1]
+    ema_fast = ta.trend.EMAIndicator(close, window=9).ema_indicator().values[-1]
+    ema_slow = ta.trend.EMAIndicator(close, window=21).ema_indicator().values[-1]
 
-# 下單（做多）
-def place_order(symbol, side):
-    path = "/openApi/swap/v2/trade/order"
+    uptrend = ema_fast > ema_slow
+    buy_signal = uptrend and rsi < 30 and macd_diff > 0
+    return buy_signal
+
+def place_order(symbol):
     timestamp = get_server_time()
-    data = {
+    params = {
         "symbol": symbol,
-        "side": side,
-        "type": "MARKET",
+        "side": "BUY",
         "positionSide": "LONG",
-        "quantity": str(TRADE_AMOUNT),
+        "type": "MARKET",
+        "quantity": TRADE_AMOUNT,
         "timestamp": timestamp,
-        "recvWindow": 5000,
+        "recvWindow": 5000
     }
-    query_string = '&'.join([f"{k}={v}" for k, v in sorted(data.items())])
-    data["signature"] = sign(query_string, API_SECRET)
+    params["signature"] = sign(params)
     headers = {"X-BX-APIKEY": API_KEY}
-    response = requests.post(f"{BASE_URL}{path}", headers=headers, params=data)
-    print(f"{symbol} 下單結果：", response.json())
+    url = f"{BASE_URL}/openApi/swap/v2/trade/order"
+    res = requests.post(url, headers=headers, data=params)
+    print(f"Order placed for {symbol}: {res.text}")
 
-# 主程式邏輯
 def main():
-    symbols = TRADE_SYMBOLS or get_symbols()
-    for symbol in symbols:
+    for symbol in get_symbols():
         try:
-            prices = get_klines(symbol)
-            ema_fast, ema_slow, rsi, macd, macdsignal = calculate_indicators(prices)
-            if should_open_long(ema_fast, ema_slow, rsi, macd, macdsignal):
-                place_order(symbol, "BUY")
+            klines = get_klines(symbol)
+            if calculate_signals(klines):
+                place_order(symbol)
         except Exception as e:
-            print(f"{symbol} 處理失敗：{e}")
+            print(f"Error with {symbol}: {e}")
 
-# 每30分鐘運行一次（配合 GitHub Actions）
 if __name__ == "__main__":
     main()
