@@ -1,3 +1,38 @@
+import requests
+import time
+import hmac
+import hashlib
+import os
+
+# 如果你是使用 GitHub Actions 的話，就從環境變數中讀取
+API_KEY = os.environ.get("BINGX_API_KEY")
+SECRET_KEY = os.environ.get("BINGX_SECRET_KEY")
+BASE_URL = 'https://open-api.bingx.com'
+
+def sign_request(params, secret):
+    query_string = '&'.join([f"{key}={params[key]}" for key in sorted(params)])
+    signature = hmac.new(secret.encode('utf-8'), query_string.encode('utf-8'), hashlib.sha256).hexdigest()
+    return signature
+
+def test_api_key():
+    timestamp = int(time.time() * 1000)
+    params = {
+        "timestamp": timestamp
+    }
+    params["signature"] = sign_request(params, SECRET_KEY)
+
+    headers = {
+        "X-BX-APIKEY": API_KEY
+    }
+
+    try:
+        response = requests.get(f"{BASE_URL}/openApi/swap/v2/user/balance", headers=headers, params=params)
+        print("✅ API 測試結果：", response.status_code, response.text)
+    except Exception as e:
+        print("❌ API 測試錯誤：", str(e))
+
+# 執行 API 測試
+test_api_key()
 import os
 import time
 import requests
