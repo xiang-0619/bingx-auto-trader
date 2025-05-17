@@ -4,7 +4,17 @@ import hmac
 import hashlib
 import numpy as np
 import ta
-from config import API_KEY, SECRET_KEY, BASE_URL, TRADE_AMOUNT
+import os
+import time
+import requests
+import numpy as np
+import ta  # 使用純 Python TA 套件
+from datetime import datetime
+
+BASE_URL = "https://open-api.bingx.com"
+API_KEY = os.getenv("BINGX_API_KEY")
+SECRET_KEY = os.getenv("BINGX_SECRET_KEY")
+TRADE_AMOUNT = 10  # 單筆下單金額（USDT）
 
 def get_server_time():
     return int(time.time() * 1000)
