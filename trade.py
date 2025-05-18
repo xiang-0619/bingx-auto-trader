@@ -1,116 +1,94 @@
-import requests
 import time
-import hmac
-import hashlib
-import json
-import os
-import datetime
+import requests
 import pandas as pd
-import numpy as np
-import ta  # 使用 ta-lib 替代方案（技術分析）
-import warnings
-warnings.filterwarnings("ignore")
+from ta.trend import EMAIndicator, MACD
+from ta.momentum import RSIIndicator
+from config import API_KEY, SECRET_KEY, BASE_URL, TRADE_AMOUNT
 
-API_KEY = os.getenv("BINGX_API_KEY")
-SECRET_KEY = os.getenv("BINGX_SECRET_KEY")
-BASE_URL = "https://open-api.bingx.com"
-TRADE_AMOUNT = 10  # 每單 USDT 數量
-
-INTERVAL = "15m"
+INTERVAL = '15m'
 LIMIT = 100
-
-headers = {
-    "X-BX-APIKEY": API_KEY
-}
-
-
-def get_server_time():
-    return str(int(time.time() * 1000))
-
-
-def sign(params):
-    query_string = '&'.join([f"{key}={params[key]}" for key in sorted(params)])
-    signature = hmac.new(SECRET_KEY.encode('utf-8'), query_string.encode('utf-8'), hashlib.sha256).hexdigest()
-    return signature
-
-
-def get_symbols():
-    url = f"{BASE_URL}/v1/market/getAllContracts"
-    response = requests.get(url).json()
-    symbols = [item['symbol'] for item in response['data'] if item['quoteAsset'] == 'USDT']
-    return symbols
-
+SYMBOLS = ['BTC-USDT', 'ETH-USDT', 'XRP-USDT']  # 可自行擴充
 
 def get_klines(symbol):
-    url = f"{BASE_URL}/v1/market/kline"
-    params = {
-        "symbol": symbol,
-        "interval": INTERVAL,
-        "limit": LIMIT
-    }
-    response = requests.get(url, params=params).json()
-    if 'data' not in response:
+    url = f"{BASE_URL}/v1/market/kline?symbol={symbol}&interval={INTERVAL}&limit={LIMIT}"
+    try:
+        response = requests.get(url)
+        data = response.json()['data']
+        df = pd.DataFrame(data)[['close', 'high', 'low', 'open', 'volume', 'timestamp']]
+        df.columns = ['close', 'high', 'low', 'open', 'volume', 'timestamp']
+        df = df.astype(float)
+        return df
+    except:
         return None
-    df = pd.DataFrame(response['data'])
-    df.columns = ["timestamp", "open", "high", "low", "close", "volume"]
-    df["timestamp"] = pd.to_datetime(df["timestamp"], unit='ms')
-    df = df.astype({"open": float, "high": float, "low": float, "close": float, "volume": float})
-    return df
 
+def signal_generator(df):
+    close = df['close']
+    open_ = df['open']
 
-def apply_strategy(df):
-    df['ema_fast'] = ta.trend.ema_indicator(df['close'], window=8).ema_indicator()
-    df['ema_slow'] = ta.trend.ema_indicator(df['close'], window=21).ema_indicator()
-    df['rsi'] = ta.momentum.rsi(df['close'], window=14)
-    macd = ta.trend.macd(df['close'])
-    df['macd_diff'] = macd.macd_diff()
+    ema_fast = EMAIndicator(close, window=9).ema_indicator()
+    ema_slow = EMAIndicator(close, window=21).ema_indicator()
+    macd = MACD(close).macd_diff()
+    rsi = RSIIndicator(close, window=14).rsi()
 
-    # 強化：多頭排列 + RSI 回升 + MACD 柱翻正 + 波動篩選
-    latest = df.iloc[-1]
-    prev = df.iloc[-2]
+    latest = -1
+    previous = -2
 
-    conditions = [
-        latest['ema_fast'] > latest['ema_slow'],               # EMA 多頭排列
-        latest['rsi'] > 50 and latest['rsi'] > prev['rsi'],    # RSI 回升
-        latest['macd_diff'] > 0 and prev['macd_diff'] <= 0,    # MACD 柱翻正
-        (latest['high'] - latest['low']) > (latest['close'] * 0.01)  # 波動 > 1%
-    ]
-    return all(conditions)
+    long_condition = (
+        ema_fast[latest] > ema_slow[latest] and
+        macd[previous] < 0 and macd[latest] > 0 and
+        rsi[previous] < 50 and rsi[latest] > 50
+    )
 
+    short_condition = (
+        ema_fast[latest] < ema_slow[latest] and
+        macd[previous] > 0 and macd[latest] < 0 and
+        rsi[previous] > 50 and rsi[latest] < 50
+    )
+
+    if long_condition:
+        return 'long'
+    elif short_condition:
+        return 'short'
+    else:
+        return None
 
 def place_order(symbol, side):
-    timestamp = get_server_time()
-    url = f"{BASE_URL}/v1/user/market/order"
-    params = {
+    url = f"{BASE_URL}/v1/user/trade/contract/order"
+    headers = {"X-BX-APIKEY": API_KEY}
+    data = {
         "symbol": symbol,
-        "side": side,
-        "positionSide": "LONG",
-        "type": "MARKET",
-        "quantity": str(TRADE_AMOUNT),
-        "timestamp": timestamp
+        "price": "0",
+        "vol": TRADE_AMOUNT,
+        "side": 1 if side == "long" else 2,
+        "type": 1,
+        "open_type": "isolated",
+        "position_id": 0,
+        "leverage": 20,
+        "external_oid": str(int(time.time() * 1000)),
+        "stop_loss_price": "",
+        "take_profit_price": "",
+        "position_mode": "double_hold"
     }
-    params['signature'] = sign(params)
-    response = requests.post(url, headers=headers, data=params)
-    print(f"下單結果 ({symbol}):", response.text)
 
+    # ⚠️ TODO: 加入簽名等認證邏輯（若使用 BingX API）
+    try:
+        response = requests.post(url, json=data, headers=headers)
+        print(f"[{symbol}] {side.upper()} order placed: {response.text}")
+    except Exception as e:
+        print(f"[{symbol}] Order failed: {e}")
 
 def main():
-    symbols = get_symbols()
-    print(f"共取得 {len(symbols)} 個交易對")
-    for symbol in symbols:
-        try:
-            df = get_klines(symbol)
-            if df is not None and len(df) >= 30:
-                if apply_strategy(df):
-                    print(f"[✅ 訊號] {symbol} 符合條件，嘗試開多單")
-                    place_order(symbol, "BUY")
-                else:
-                    print(f"[❌ 無訊號] {symbol} 略過")
-            else:
-                print(f"[⚠️ 資料不足] {symbol} 無法分析")
-        except Exception as e:
-            print(f"[錯誤] {symbol}: {e}")
+    for symbol in SYMBOLS:
+        df = get_klines(symbol)
+        if df is None or df.empty:
+            print(f"[{symbol}] K線資料獲取失敗")
+            continue
 
+        signal = signal_generator(df)
+        if signal:
+            place_order(symbol, signal)
+        else:
+            print(f"[{symbol}] 無明確訊號")
 
 if __name__ == "__main__":
     main()
