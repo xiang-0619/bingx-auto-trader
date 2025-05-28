@@ -1,126 +1,61 @@
+import json
 import requests
 import time
-import json
-import hmac
-import hashlib
-import ta
-import pandas as pd
 from datetime import datetime
+from strategy import should_open_position
+from utils import get_symbols, get_balance, get_position, place_order, log_message
 
-with open('config.json') as f:
+# 讀取設定檔
+with open("config.json") as f:
     config = json.load(f)
 
-API_KEY = config['api_key']
-API_SECRET = config['api_secret']
-BASE_URL = 'https://api.bingx.com'
+API_KEY = config["api_key"]
+API_SECRET = config["api_secret"]
+TRADE_AMOUNT = float(config.get("trade_amount", 10))
+LEVERAGE = int(config.get("leverage", 20))
+BASE_URL = "https://api-swap.bingx.com"
 
-HEADERS = {
-    'Content-Type': 'application/json',
-    'X-BX-APIKEY': API_KEY
-}
+print(f"🚀 交易腳本啟動：目標每單 {TRADE_AMOUNT} USDT，槓桿 {LEVERAGE} 倍")
 
-SYMBOLS_URL = 'https://api.bingx.com/api/v1/market/getAllContracts'
+# 取得目前可用 USDT 餘額
+usdt_balance = get_balance(API_KEY, API_SECRET)
+print(f"💰 當前可用 USDT 餘額：{usdt_balance:.2f} USDT")
 
-def sign(params, secret):
-    query_string = '&'.join([f"{k}={v}" for k, v in sorted(params.items())])
-    return hmac.new(secret.encode(), query_string.encode(), hashlib.sha256).hexdigest()
+# 計算每單實際所需保證金（含緩衝）
+required_margin = TRADE_AMOUNT / LEVERAGE + 0.5
+print(f"📊 每單所需保證金（含緩衝）：{required_margin:.2f} USDT")
 
-def get_symbols():
+if usdt_balance < required_margin:
+    print("⚠️ 可用資金不足，跳過所有下單")
+    exit()
+
+# 獲取可交易幣種
+symbols = get_symbols()
+
+for symbol in symbols:
     try:
-        response = requests.get(SYMBOLS_URL)
-        symbols = response.json()['data']
-        return [s['symbol'] for s in symbols if s['contractType'] == 'linear_perpetual']
-    except Exception as e:
-        print("Failed to get symbols:", e)
-        return []
-
-def get_klines(symbol, interval='15m', limit=100):
-    url = f"{BASE_URL}/v1/market/kline"
-    params = {
-        "symbol": symbol,
-        "interval": interval,
-        "limit": limit
-    }
-    try:
-        res = requests.get(url, params=params).json()
-        df = pd.DataFrame(res['data'])
-        df.columns = ['timestamp', 'open', 'high', 'low', 'close', 'volume']
-        df['close'] = pd.to_numeric(df['close'])
-        df['open'] = pd.to_numeric(df['open'])
-        df['high'] = pd.to_numeric(df['high'])
-        df['low'] = pd.to_numeric(df['low'])
-        return df
-    except Exception as e:
-        print(f"[{symbol}] Failed to get kline:", e)
-        return None
-
-def analyze(df):
-    df['ema_fast'] = ta.trend.ema_indicator(df['close'], window=9).ema_indicator()
-    df['ema_slow'] = ta.trend.ema_indicator(df['close'], window=21).ema_indicator()
-    df['macd'] = ta.trend.macd_diff(df['close'])
-    df['rsi'] = ta.momentum.RSIIndicator(df['close']).rsi()
-    last = df.iloc[-1]
-    prev = df.iloc[-2]
-    
-    signal_macd = prev['macd'] < 0 and last['macd'] > 0
-    signal_rsi = prev['rsi'] < 30 and last['rsi'] > 30
-    trend_ok = last['ema_fast'] >= last['ema_slow']
-    return signal_macd and signal_rsi and trend_ok
-
-def place_order(symbol, side, amount):
-    url = f"{BASE_URL}/v1/user/market/order"
-    params = {
-        "symbol": symbol,
-        "side": side,
-        "type": "MARKET",
-        "positionSide": "LONG" if side == "BUY" else "SHORT",
-        "quantity": amount,
-        "timestamp": int(time.time() * 1000)
-    }
-    params['signature'] = sign(params, API_SECRET)
-    try:
-        res = requests.post(url, headers=HEADERS, data=json.dumps(params)).json()
-        print(f"[{symbol}] Order Result:", res)
-        return res
-    except Exception as e:
-        print(f"[{symbol}] Order Error:", e)
-
-def get_usdt_balance():
-    url = f"{BASE_URL}/v1/user/accounts"
-    params = {
-        "timestamp": int(time.time() * 1000)
-    }
-    params['signature'] = sign(params, API_SECRET)
-    res = requests.get(url, headers=HEADERS, params=params).json()
-    for acc in res.get('data', []):
-        if acc['asset'] == 'USDT':
-            return float(acc['availableBalance'])
-    return 0
-
-def main():
-    usdt = get_usdt_balance()
-    if usdt < 10:
-        print("資金不足，不開單")
-        return
-
-    symbols = get_symbols()
-    opened = []
-    for symbol in symbols:
-        df = get_klines(symbol)
-        if df is None or len(df) < 30:
+        # 判斷目前是否已持倉，避免重複下單
+        current_position = get_position(API_KEY, API_SECRET, symbol)
+        if current_position:
+            print(f"📌 {symbol} 已持倉，跳過")
             continue
-        try:
-            if analyze(df):
-                order_amount = round((usdt * 0.1) / df.iloc[-1]['close'], 3)
-                print(f"[{symbol}] ✅ 符合條件，準備開單")
-                place_order(symbol, "BUY", order_amount)
-                opened.append(symbol)
-            else:
-                print(f"[{symbol}] ❌ 條件不符，跳過")
-        except Exception as e:
-            print(f"[{symbol}] Error in analysis:", e)
 
-    print(f"✅ 共開單：{opened}")
+        # 判斷策略是否符合進場條件
+        decision = should_open_position(symbol)
+        if not decision["should_open"]:
+            continue
 
-if __name__ == "__main__":
-    main()
+        side = decision["side"]  # "BUY" or "SELL"
+
+        print(f"✅ 訊號成立：{symbol} - {side}，準備下單...")
+
+        order_result = place_order(API_KEY, API_SECRET, symbol, side, TRADE_AMOUNT, LEVERAGE)
+
+        if order_result["success"]:
+            print(f"🎯 成功開單：{symbol} - {side} - 金額 {TRADE_AMOUNT} USDT")
+            log_message(f"✅ {symbol} - {side} 已開單")
+        else:
+            print(f"❌ 開單失敗：{symbol} - 原因：{order_result.get('message', '未知錯誤')}")
+    
+    except Exception as e:
+        print(f"❗️ 發生錯誤：{symbol} - {str(e)}")
