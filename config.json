@@ -1,4 +1,4 @@
 {
-  "api_key": "$API_KEY",
-  "api_secret": "$API_SECRET"
+  "API_KEY": "你的API_KEY",
+  "API_SECRET": "你的API_SECRET"
 }
