@@ -32,3 +32,8 @@ def get_balance(api_key, api_secret):
     except requests.exceptions.RequestException as e:
         print(f"取得餘額失敗: {e}")
         return 0.0
+        from datetime import datetime
+
+def log_message(message):
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{now}] {message}")
