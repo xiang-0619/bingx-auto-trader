@@ -1,7 +1,4 @@
 {
-  "API_KEY": "你的API_KEY",
-  "API_SECRET": "你的API_SECRET",
-  "TRADE_AMOUNT_RATIO": 0.3,
-  "LEVERAGE": 50,
-  "SYMBOLS": ["BTC-USDT", "ETH-USDT", "SOL-USDT", "AVAX-USDT", "DOGE-USDT"]
+  "api_key": "$API_KEY",
+  "api_secret": "$API_SECRET"
 }
