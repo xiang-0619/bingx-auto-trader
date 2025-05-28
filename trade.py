@@ -18,7 +18,7 @@ BASE_URL = "https://api-swap.bingx.com"
 print(f"🚀 交易腳本啟動：目標每單 {TRADE_AMOUNT} USDT，槓桿 {LEVERAGE} 倍")
 
 # 取得目前可用 USDT 餘額
-usdt_balance = get_balance(API_KEY, API_SECRET)
+usdt_balance = get_balance()
 print(f"💰 當前可用 USDT 餘額：{usdt_balance:.2f} USDT")
 
 # 計算每單實際所需保證金（含緩衝）
