@@ -1,56 +1,24 @@
-import time
-import hmac
-import hashlib
 import requests
-import urllib.parse
 from datetime import datetime
+import logging
 
-# 從 config.json 載入金鑰
-import json
-with open("config.json", "r") as f:
-    config = json.load(f)
-
-API_KEY = config["API_KEY"]
-API_SECRET = config["API_SECRET"]
-
-# 產生簽名
-def generate_signature(params, secret):
-    query_string = urllib.parse.urlencode(sorted(params.items()))
-    signature = hmac.new(secret.encode(), query_string.encode(), hashlib.sha256).hexdigest()
-    return signature
-
-# 查詢 USDT 合約帳戶餘額（可用保證金）
-def get_balance():
-    try:
-        url = "https://contract.bingx.com/api/v1/private/account/assets"
-        timestamp = int(time.time() * 1000)
-
-        params = {
-            "timestamp": timestamp,
-            "currency": "USDT"
-        }
-
-        signature = generate_signature(params, API_SECRET)
-        params["signature"] = signature
-
-        headers = {
-            "X-BX-APIKEY": API_KEY
-        }
-
-        response = requests.get(url, headers=headers, params=params)
-        if response.status_code != 200:
-            print("❌ 錯誤：無法取得餘額，HTTP", response.status_code)
-            print("回傳內容：", response.text)
-            return 0.0
-
-        data = response.json()
-        balance = float(data["data"]["availableBalance"])
-        return balance
-    except Exception as e:
-        print("❌ 發生例外錯誤：", str(e))
-        return 0.0
-
-# 輸出日誌
-def log_message(msg):
+def log_message(message):
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    print(f"[{now}] {msg}")
+    print(f"[{now}] {message}")
+    logging.info(message)
+
+def get_symbols():
+    url = "https://open-api.bingx.com/openApi/swap/v2/quote/contracts"
+    try:
+        response = requests.get(url)
+        data = response.json()
+        return [item["symbol"] for item in data["data"] if item["status"] == "TRADING"]
+    except Exception as e:
+        log_message(f"⚠️ 無法獲取幣種列表: {e}")
+        return []
+
+def strategy_should_open_long(symbol):
+    # ✅ 這是一個簡單範例策略，建議你換成自己的策略邏輯
+    # 為了示範方便，這裡隨機開倉（不建議實際使用）
+    import random
+    return random.random() < 0.03  # 大約 3% 機率開單
