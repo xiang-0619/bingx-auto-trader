@@ -3,42 +3,32 @@ import time
 import hmac
 import hashlib
 
-BASE_URL = "https://api-swap.bingx.com"
+BASE_URL = "https://contract.bingx.com"  # 正確的永續合約 API 主機
 
 def get_timestamp():
-    return str(int(time.time() * 1000))
+    return int(time.time() * 1000)
 
-def sign_request(secret_key, params):
-    query_string = '&'.join([f"{key}={params[key]}" for key in sorted(params)])
-    return hmac.new(secret_key.encode(), query_string.encode(), hashlib.sha256).hexdigest()
+def sign(params, secret):
+    query_string = '&'.join([f"{k}={params[k]}" for k in sorted(params)])
+    return hmac.new(secret.encode(), query_string.encode(), hashlib.sha256).hexdigest()
 
 def get_balance(api_key, api_secret):
-    endpoint = "/swap-api/v1/user/balance"
-    url = BASE_URL + endpoint
-
+    url = BASE_URL + "/api/v1/private/account/assets"
     params = {
-        "timestamp": get_timestamp()
+        "timestamp": get_timestamp(),
+        "currency": "USDT"
     }
-    signature = sign_request(api_secret, params)
-    headers = {
-        "X-BX-APIKEY": api_key
-    }
-
+    signature = sign(params, api_secret)
     params["signature"] = signature
-    response = requests.get(url, headers=headers, params=params)
-    data = response.json()
-
-    if data.get("code") != 0:
-        print("❌ 取得資金失敗：", data)
-        return 0
-
-    usdt_balance = 0
-    for asset in data["data"]:
-        if asset["asset"] == "USDT":
-            usdt_balance = float(asset["availableMargin"])
-            break
-
-    return usdt_balance
-
-def log_message(msg):
-    print(f"📋 LOG：{msg}")
+    headers = {
+        "X-API-KEY": api_key
+    }
+    try:
+        response = requests.get(url, headers=headers, params=params, timeout=10)
+        response.raise_for_status()
+        data = response.json()
+        # 根據 BingX 永續合約的 API 回傳結構做調整，這裡假設 data['data']['availableBalance']
+        return float(data['data']['availableBalance'])
+    except requests.exceptions.RequestException as e:
+        print(f"取得餘額失敗: {e}")
+        return 0.0
